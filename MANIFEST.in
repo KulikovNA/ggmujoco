@@ -1,0 +1,9 @@
+# Включаем requirements.txt
+include requirements.txt
+
+# Включаем README
+include README.md
+
+# Исключаем кеши
+exclude __pycache__
+exclude *.pyc

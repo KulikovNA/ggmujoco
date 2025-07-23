@@ -1,0 +1,4 @@
+spatialmath-python
+msgpack
+roboticstoolbox-python
+mujoco==3.2.3
