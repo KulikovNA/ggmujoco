@@ -264,13 +264,6 @@ def run_scene(*,
                 vis.reset_view_point(True); first_fit = False
             vis.poll_events(); vis.update_renderer(); viewer.sync()
 
-            # ---------- сохранение по таймеру ----------
-            """if not saved and (time.time() - start_real >= save_after):
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                o3d.io.write_point_cloud(str(out_path / f"cloud_{ts}.ply"), pc,
-                                        write_ascii=False, compressed=True)
-                saved = True; print("Point‑cloud сохранён")
-            """
             # ---------- выход ----------
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or not viewer.is_running():

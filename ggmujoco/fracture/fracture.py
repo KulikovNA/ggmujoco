@@ -8,13 +8,19 @@
 
 from __future__ import annotations
 
+import sys, shutil, tarfile, tempfile, urllib.request as ul
 import json
 import os
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import List, Tuple, Union
+import contextlib
 
+
+try:
+    from tqdm import tqdm          # красивый прогресс‑бар
+except ImportError:
+    tqdm = None                    # fallback → текстовый %
 
 class BlenderFractureManager:
     """
@@ -36,16 +42,121 @@ class BlenderFractureManager:
 
     # ────────────────────────── init ────────────────────────────────
     def __init__(self, permanent_dir: StrOrPath | None = None) -> None:
-        os.environ["BLENDER"] = os.path.expanduser(self.BLENDER_DEFAULT)
-        self.blender_bin: str = os.environ["BLENDER"]
+        # 
+        self._tmp_owned = False    
+        self._out_dir   = None       
 
+        blender_path, _ = self.ensure_blender_installed()
+
+        os.environ["BLENDER"] = blender_path
+        self.blender_bin: str = blender_path
+
+        # 
         if permanent_dir is None:
             self._out_dir   = Path(tempfile.mkdtemp(prefix="fractured_"))
             self._tmp_owned = True
         else:
             self._out_dir   = Path(permanent_dir).expanduser().resolve()
             self._out_dir.mkdir(parents=True, exist_ok=True)
-            self._tmp_owned = False
+
+
+    @staticmethod
+    def _download_with_progress(url: str, dst: Path) -> None:
+        opener = ul.build_opener()
+        opener.addheaders = [('User-Agent', 'Mozilla/5.0')]
+        ul.install_opener(opener)
+
+        with ul.urlopen(url) as resp, open(dst, "wb") as out:
+            total = int(resp.getheader("Content-Length", 0))
+            block = 1 << 20                       # 1 MiB
+
+            if tqdm:
+                pbar = tqdm(total=total, unit='B', unit_scale=True,
+                            desc='Downloading', leave=False)
+            else:
+                pbar, done = None, 0
+
+            while True:
+                buf = resp.read(block)
+                if not buf:
+                    break
+                out.write(buf)
+                if pbar:
+                    pbar.update(len(buf))
+                else:
+                    done += len(buf)
+                    percent = done * 100 // total
+                    sys.stdout.write(f"\rDownloading… {percent:3d}%")
+                    sys.stdout.flush()
+
+            if pbar:
+                pbar.close()
+            else:
+                print()
+
+    @staticmethod
+    def _extract_tarxz_with_progress(tar_path: Path, dest: Path) -> None:
+        with tarfile.open(tar_path, "r:xz") as tar:
+            members = tar.getmembers()
+            total   = len(members)
+
+            if tqdm:
+                pbar = tqdm(total=total, desc='Extracting', leave=False)
+            else:
+                pbar, done = None, 0
+
+            for m in members:
+                tar.extract(m, path=dest)
+                if pbar:
+                    pbar.update(1)
+                else:
+                    done += 1
+                    percent = done * 100 // total
+                    sys.stdout.write(f"\rExtracting… {percent:3d}%")
+                    sys.stdout.flush()
+
+            if pbar:
+                pbar.close()
+            else:
+                print()
+
+    @staticmethod
+    def ensure_blender_installed(
+        version: str = "3.5.1",
+        install_root: str | Path = "~/blender",
+        reinstall: bool = False,
+    ) -> Tuple[str, str]:
+        """
+        Проверяет, установлен ли Blender требуемой версии.
+        Если нет – скачивает с прогресс‑баром и распаковывает.
+        """
+        install_root = Path(os.path.expanduser(install_root)).resolve()
+        folder_name  = f"blender-{version}-linux-x64"
+        target_dir   = install_root / folder_name
+        blender_bin  = target_dir / "blender"
+        major_minor  = ".".join(version.split(".")[:2])
+
+        if reinstall and target_dir.exists():
+            print(f"[Blender] Reinstall requested – удаляю {target_dir}")
+            shutil.rmtree(target_dir)
+
+        if blender_bin.exists():
+            return str(blender_bin), major_minor
+
+        url = f"https://download.blender.org/release/Blender{major_minor}/{folder_name}.tar.xz"
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tar.xz") as tmp:
+            BlenderFractureManager._download_with_progress(url, Path(tmp.name))
+
+        print(f"[Blender] Распаковываю архив в {install_root}")
+        install_root.mkdir(parents=True, exist_ok=True)
+        BlenderFractureManager._extract_tarxz_with_progress(Path(tmp.name), install_root)
+        Path(tmp.name).unlink(missing_ok=True)
+
+        if not blender_bin.exists():
+            raise RuntimeError("Blender не удалось установить или путь к бинарнику не найден.")
+
+        return str(blender_bin), major_minor
 
     # ───────────────────── публичный вызов ───────────────────────────
     def fracture(
@@ -153,5 +264,7 @@ class BlenderFractureManager:
             self.cleanup()
 
     def __del__(self) -> None:
-        if self._tmp_owned:
-            self.cleanup()
+        # ░░░ 4. Безопасная проверка ░░░
+        if getattr(self, "_tmp_owned", False):
+            with contextlib.suppress(Exception):
+                self.cleanup()

@@ -21,8 +21,7 @@ from collections import namedtuple
 from spatialmath import SE3
 
 from ggmujoco.fracture import BlenderFractureManager
-from ggmujoco.scene import build_mjcf
-from ggmujoco.utils import (euler_to_quat, load_intrinsics, pick_folder, pick_color_map, update_grasps)
+from ggmujoco.utils import (euler_to_quat, load_intrinsics, pick_folder, pick_color_map, depth_rgb_to_pointcloud, simulation_falling_objects, manipulation, get_model_xml)
 from sbg_inference import SBGGraspDetector
 
 # Импорт пользовательских модулей из simlib
@@ -35,7 +34,7 @@ from ggmujoco.simlib import ik_driver as ikd    # драйвер обратно�
 from ggmujoco.simlib import tcp_eval, logutil   # оценка ошибки TCP и логирование
 from ggmujoco.simlib import gripper             # управление ЗУ
 
-
+from ggmujoco.visualizers import OpenCVViewer, Open3DViewer
 
 # ──────────────────────────────────────────────
 # CONSTANTS
@@ -48,6 +47,9 @@ MODELS_DIR        = RESOURCE_DIR / "differBig/models"
 DEFAULT_INTR_FILE = RESOURCE_DIR / "cam_d435" / "camera_435_640x480.json"
 OUT_DIR           = (ROOT / "output").resolve()
 MANIP_PATH         = RESOURCE_DIR / "panda_fixed.xml"
+CHECKPOINT_SBG     = (ROOT / "weights/sbg_full_module/checkpoint.tar").resolve() 
+YOLO_YAML          = (ROOT / "weights/yolo_module/merged_yolo_dataset2.yaml").resolve()
+CHECKPOINT_YOLO    = (ROOT / "weights/yolo_module/best.onnx").resolve()
 
 RGB_CAM, DEPTH_CAM = "rgb_cam", "depth_cam"
 DEFAULT_SAVE_AFTER = 20.0      # секунд до сохранения point‑cloud
@@ -60,17 +62,11 @@ _FALLBACK_PREOPEN = cfg.GRIPPER_OPEN_M
 _FALLBACK_CLOSE   = cfg.GRIPPER_CLOSE_M
 _F_THRESH = 150.0
 
-def _plan_gripper_widths(width_net_m: float):
-    if not np.isfinite(width_net_m) or width_net_m <= 0.0:
-        return _FALLBACK_PREOPEN, _FALLBACK_CLOSE
-    w_pre   = min(width_net_m + _PREOPEN_EXTRA_M, cfg.GRIPPER_OPEN_M)
-    w_close = max(width_net_m - _CLOSE_MARGIN_M, cfg.GRIPPER_CLOSE_M)
-    return (w_pre, w_close) if w_close <= w_pre else (w_pre, w_pre)
+R_FLIP = o3d.geometry.get_rotation_matrix_from_xyz([math.pi, 0, 0])
+
 
 def _mk_tcp2tip():
     return SE3.Tz(cfg.TCP2TIP_Z) if cfg.USE_TCP_TIP else None
-
-
 
 # ──────────────────────────────────────────────
 # MAIN SCENE RUNNER
@@ -104,14 +100,6 @@ def run_scene(*,
     # ── intrinsics -------------------------------------------------
     cam_fovy, img_w, img_h = load_intrinsics(intr_path)
 
-    # ── floor texture ---------------------------------------------
-    texture_cfg = {
-        "file":            pick_color_map(pick_folder(textures_path)),
-        "texrepeat_range": (5.0, 10.0),
-        "metal_prob":      0.0,
-        "rgba_jitter":     0.08,
-    }
-
     # ── fracture PLY → OBJ ----------------------------------------
     ply_files = sorted(models_path.glob("*.ply"))
     if not ply_files:
@@ -128,75 +116,12 @@ def run_scene(*,
         #voxel = 1.5
         #scale=0.5
     )
-    # ── obj & materials ----------------------------------------
-    # не будем сильно отсвечивать: specular_rng и shininess_rng в минималку 
-    obj_mat_cfg = {"metal_prob": 0.2, 
-                   "rgba_jitter": 0.25, 
-                   "specular_rng": (0.01, 0.1), 
-                   "shininess_rng": (0.0, 0.09),
-                   }
-
-    # ── lights & materials ----------------------------------------
-    light_cfg = {
-        "num":             3,#np.random.randint(1, 2),
-        "xy_radius":       0.5,
-        "z_range":         (1.0, 1.2),
-        "kelvin_range":    (3000., 8000.),
-        "intensity_range": (0.6, 0.7),
-        "ambient":         (0.1, 0.1, 0.1),
-        "directional":     False,
-    }
-    # ── cams & ... ----------------------------------------
-    cam_quat = euler_to_quat(0, -60, 180)
-    cam_cfg = {
-        "body_pose": (0.0, 0.4, 0.6),
-        "body_quat": cam_quat,
-        "geom_box_size": (0.03, 0.05, 0.02),
-        
-        "name_rbg_cam": RGB_CAM,
-        "rgb_cam_quat": (0.5, 0.5, 0.5, 0.5),
-        "rgb_cam_pose": (0.0, 0.0, 0.0),
-        "camera_fovy": cam_fovy,
-
-        "name_depth_cam": DEPTH_CAM,
-        "rgb_cam_quat": (0.5, 0.5, 0.5, 0.5),
-        "rgb_cam_pose": (0.0, 0.0, 0.0)
-    }
-    # ── Render ----------------------------------------
-    visual_cfg = {
-        "offwidth": img_w, "offheight": img_h,
-        "fovy": cam_fovy,
-        "orthographic": False,
-        "shadowsize":   8192,
-        "offsamples":   1024,
-        "znear": 0.02, "zfar": 20.0,
-        "fogstart": 2.0, "fogend": 8.0,
-        "haze": 0.2,
-        "shadowclip": 2.0, "shadowscale": 0.9,
-        "smoothing":    True
-        }
-    
-    # ── build MJCF -------------------------------------------------
-    # camera_quat = (0.5, 0.5, 0.5, 0.5), 
-    model_xml = build_mjcf(
-        texture_cfg = texture_cfg,
-        resource      = resource_path,
-        frac_paths  = frac_paths,
-        assets = assets_path,
-        obj_scale   = 0.0008, 
-        prob_drop   = PROB_DROP,
-        manip_path  = manip_path, 
-        center_xy   = (0.3, 0.4),
-        visual_cfg = visual_cfg,
-        cam_cfg     = cam_cfg,
-        light_cfg   = light_cfg,
-        obj_mat_cfg = obj_mat_cfg,
-    )
+    model_xml = get_model_xml(textures_path, frac_paths, cam_fovy, img_w, img_h, resource_path, assets_path, manip_path, RGB_CAM, DEPTH_CAM, PROB_DROP)
 
     # ── MuJoCo model & renderers ─────────────────────────────────────────
     model  = mujoco.MjModel.from_xml_string(model_xml)
     data   = mujoco.MjData(model)
-
+    #model.opt.timestep   = 0.0003
     # ------------------------ создаём MjContext ----------------------------------
     # (cam_id, base_id и др. читаем из XML по именам в cfg)
     cam_id  = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, cfg.CAM_NAME)
@@ -214,24 +139,18 @@ def run_scene(*,
     _tcp2tip = _mk_tcp2tip()                   # смещение TCP→кончик инструмента
 
     rgb_r  = mujoco.Renderer(model, width=img_w, height=img_h, max_geom=50_000)
-    depth_r = mujoco.Renderer(model, width=img_w, height=img_h); depth_r.enable_depth_rendering()
+    depth_r = mujoco.Renderer(model, width=img_w, height=img_h); 
+    depth_r.enable_depth_rendering()
 
     # ── пассивное окно MuJoCo (только для просмотра) --------------------
     viewer = mujoco.viewer.launch_passive(model, data)
-    
-    # открыть ЗУ в начале
-    gripper.gripper_open(ctx, viewer=viewer)
 
     # ── Open3D окно -----------------------------------------------------
-    vis = o3d.visualization.Visualizer(); vis.create_window("PointCloud", img_w, img_h)
-    pc  = o3d.geometry.PointCloud();      vis.add_geometry(pc)
-    grasp_geoms = []
-    R_FLIP = o3d.geometry.get_rotation_matrix_from_xyz([math.pi, 0, 0])
-
+    o3d_viz = Open3DViewer(img_w, img_h)
+    o3d_viz.show_async()
     # ── OpenCV окна -----------------------------------------------------
-    cv2.namedWindow("RGB", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("Seg+Grasps", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("Masks", cv2.WINDOW_AUTOSIZE)
+    cv_viz = OpenCVViewer()
+
 
     # ── предрасчёт сеток для point‑cloud --------------------------------
     intr_json = json.loads(intr_path.read_text())
@@ -242,9 +161,9 @@ def run_scene(*,
 
     # ── SBG‑детектор (как раньше) ---------------------------------------
     det = SBGGraspDetector(
-        checkpoint_path="/home/nikita/diplom/ggmujoco/weights/sbg_full_module/checkpoint.tar",
-        onnx_seg="/home/nikita/diplom/ggmujoco/weights/yolo_module/best.onnx",
-        seg_yaml="/home/nikita/diplom/ggmujoco/weights/yolo_module/merged_yolo_dataset2.yaml",
+        checkpoint_path=CHECKPOINT_SBG,
+        onnx_seg=CHECKPOINT_YOLO,
+        seg_yaml=YOLO_YAML,
         num_view=300, collision_thresh=0.0, voxel_size=0.01,
         bbox_depth_pad=0.30, bbox_xy_pad=0.00,
         max_grasp_num=100, gripper_width_max=1.2,
@@ -252,125 +171,54 @@ def run_scene(*,
     )
 
     # ── цикл симуляции ---------------------------------------------------
-    start_real, saved    = time.time(), False
-    start_sim            = data.time
-    gg                   = None                      # захваты появятся позже
-    first_fit            = True
-
-    loop_cnt  = 0                 # счётчик кадров
-    dbg_every = 30                # печатать каждые N кадров (чтобы не спамить)
-    
+    gg         = None       # захваты появятся позже
+    loop_cnt   = 0          # счётчик кадров
     grasp_done = False      # выполнен ли уже захват
-
+    num = 0 
     try:
         while True:
             
             loop_cnt += 1
 
-            # физический шаг MuJoCo
-            mujoco.mj_step(model, data)
-
-            if loop_cnt % dbg_every == 0:
-                print(f"[DBG] loop={loop_cnt:05d}  sim_t={data.time:6.3f}  "
-                    f"viewer_running={viewer.is_running()}")
+            # ── 1. физика для падения объектов
+            simulation_falling_objects(mujoco,
+                                model, 
+                                data, 
+                                time_simulation = 1.0, 
+                                timestep = 0.0006, 
+                                visual_on = True,
+                                viewer = viewer)
+    
+            print(f"[DBG] loop={loop_cnt:05d}  sim_t={data.time:6.3f}  "
+                f"viewer_running={viewer.is_running()}")
 
             # ---------- рендер RGB / depth ----------
-            rgb_r.update_scene(data, camera=RGB_CAM);     rgb_img   = rgb_r.render()[..., ::-1]
-            depth_r.update_scene(data, camera=DEPTH_CAM); depth_img = depth_r.render()
+            rgb_r.update_scene(data, camera=RGB_CAM);     
+            rgb_img   = rgb_r.render()[..., ::-1]
+            depth_r.update_scene(data, camera=DEPTH_CAM); 
+            depth_img = depth_r.render()
 
+            # визуализация рендера изображения
+            cv_viz.update("RGB", rgb_img)
+
+            # перевод в облако точек 
+            pts, clr = depth_rgb_to_pointcloud(depth_img, rgb_img, fx, fy, cx, cy)
+            # визуализация облака точек
+            o3d_viz.update_cloud(pts, clr)
+            
             # ---------- однократный SBG ----------
-            if (not grasp_done) and (data.time - start_sim >= SETTLE_T):
-                gg, seg_vis, mask_vis = det.infer(rgb_img, depth_img, intr, depth_scale=1.0)
-                print(f"[{data.time:6.2f}s] grasp‑кандидатов: {gg.shape[0]}")
-                update_grasps(vis, grasp_geoms, gg, R_FLIP, max_show=50)
+            gg_array, gg, seg_vis, mask_vis = det.infer(rgb_img, depth_img, intr, depth_scale=1.0)
+            print(f"[{data.time:6.2f}s] grasp‑кандидатов: {gg.shape[0]}")
 
-            # ---------- управление манипулятором после инференса ----------
+            # визуализация захватов и масок
+            o3d_viz.update_scene(pts, clr, gg)
+            cv_viz.update("Seg+Grasps", seg_vis)
+            cv_viz.update("Masks", mask_vis)
+
+            # ---------- перемещение объекта/объектов манипулятором ----------
             if gg is not None and (not grasp_done) and gg.shape[0] > 0:
-                g_row = gg[0]
-                # разбор строки grasp (используем готовую функцию)
-                t_cv, R_cv_raw, w, h, d, score, _ = sbg.parse_grasp_row(g_row)
-                R_cv = tr.ortho_project(R_cv_raw)
+                manipulation(viewer, gg, _tcp2tip, ctx, _PREOPEN_EXTRA_M, _CLOSE_MARGIN_M, _FALLBACK_PREOPEN, _FALLBACK_CLOSE, _F_THRESH)
 
-                # преобразуем в систему базы робота
-                G_net, G_tcp = tr.camcv2base(
-                    t_cv, R_cv, mj.T_b_c_gl(ctx), depth=d, tcp2tip=_tcp2tip
-                )
-
-                # -------- планирование захвата --------
-                w_pre, _ = _plan_gripper_widths(w)
-                gripper.gripper_set(ctx, w_pre, viewer=viewer)
-
-                ok, _ = ikd.goto_arm(
-                    ctx,
-                    G_tcp.t,
-                    tr.safe_uq_from_R(G_tcp.R).vec,
-                    viewer=viewer,
-                )
-
-                if ok:
-                    gripper.gripper_close_until(
-                        ctx, f_thresh=_F_THRESH, step_ctrl=5e-4, viewer=viewer
-                    )
-
-                    # подъём детали на 0.1 м
-                    lift_target = G_tcp.t + np.array([0.0, 0.0, 0.10])
-                    ikd.goto_arm(
-                        ctx,
-                        lift_target,
-                        tr.safe_uq_from_R(G_tcp.R).vec,
-                        viewer=viewer,
-                    )
-
-                    gripper.gripper_open(ctx, viewer=viewer)
-                else:
-                    print('[IK] не удалось дотянуться до grasp‑позы')
-
-                grasp_done = True
-
-            # ---------- OpenCV окна ----------
-            cv2.imshow("RGB", rgb_img)
-            if gg is not None:
-                cv2.imshow("Seg+Grasps", seg_vis); cv2.imshow("Masks", mask_vis)
-
-            # ---------- DEBUG ② ----------
-            if loop_cnt % dbg_every == 0:
-                print(f"[DBG] pc_pts={len(pc.points):6d}  "
-                    f"grasp_geoms={len(grasp_geoms):3d}")
-                
-            # ---------- Point Cloud (статично) ----------
-            z   = depth_img.astype(np.float32).ravel()
-            msk = (z > 0) & (z < 1.0) & np.isfinite(z)
-
-            X = (u[msk] - cx) * z[msk] / fx          # X вправо
-            Y = (v[msk] - cy) * z[msk] / fy          # Y вниз
-            pts_cam = np.column_stack((X, Y, z[msk]))  # (N,3)
-
-            pts = pts_cam @ R_FLIP.T                   # (x,‑y,‑z) → Open3D
-            clr = rgb_img.reshape(-1, 3)[msk] / 255.0
-
-            # обновляем буферы без поворота геометрии
-            pc.points = o3d.utility.Vector3dVector(pts)
-            pc.colors = o3d.utility.Vector3dVector(clr)
-            vis.update_geometry(pc)
-
-            # ---------- рендер Open3D / MuJoCo viewer ----------
-            if first_fit:
-                vis.reset_view_point(True); first_fit = False
-            vis.poll_events(); vis.update_renderer(); viewer.sync()
-
-            # ---------- сохранение по таймеру ----------
-            """if not saved and (time.time() - start_real >= save_after):
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                o3d.io.write_point_cloud(str(out_path / f"cloud_{ts}.ply"), pc,
-                                        write_ascii=False, compressed=True)
-                saved = True; print("Point‑cloud сохранён")
-            """
-            # ---------- выход ----------
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27 or not viewer.is_running():
-                print("[DBG] exit condition hit: "
-                    f"key={key}  viewer_running={viewer.is_running()}")
-                break
     except KeyboardInterrupt:
         print("\n[INFO] KeyboardInterrupt — пора сворачиваться")
 
@@ -380,10 +228,8 @@ def run_scene(*,
         try:  viewer.close()
         except Exception: pass
 
-        try:  vis.destroy_window()
-        except Exception: pass
-
-        cv2.destroyAllWindows()
+        cv_viz.close()          # <-- гарантируем корректное завершение
+        o3d_viz.close() 
 
         try:  rgb_r.close(); depth_r.close()
         except Exception: pass
